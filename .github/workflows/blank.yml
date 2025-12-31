@@ -1,4 +1,4 @@
-name: Build Full USB Modules Final
+name: Build Full USB Modules Final Verified
 on: [workflow_dispatch]
 
 jobs:
@@ -7,11 +7,10 @@ jobs:
     steps:
       - name: Build in Clean Docker
         run: |
-          # 1. 启动容器并获取容器 ID
+          # 1. 启动容器
           CONTAINER_ID=$(docker run -d -u root ghcr.io/openwrt/sdk:mediatek-filogic-24.10.4 tail -f /dev/null)
           
-          # 2. 在容器内执行环境初始化
-          # 我们不猜路径，直接通过 find 找到脚本位置并进入
+          # 2. 在容器内执行环境初始化和编译
           docker exec -u root $CONTAINER_ID bash -c '
             set -e
             # 自动定位 SDK 根目录
@@ -21,14 +20,22 @@ jobs:
             # 环境准备
             export FORCE_UNSAFE_CONFIGURE=1
             ./scripts/feeds update base
+            # 必须先安装内核包定义
             ./scripts/feeds install kmod-usb-serial-option kmod-usb-net-qmi-wwan
             make defconfig
             
-            # 准备内核源码
-            make target/linux/prepare V=s
-            KSRC=$(find build_dir -name "linux-6.6.110" -type d | head -n 1)
+            # --- 关键修正：在 SDK 中解压内核源码的正确指令 ---
+            make package/kernel/linux/prepare V=s
             
-            # 下载主线最全 ID 表并覆盖 (确保 ID 最全)
+            # 自动定位解压后的内核源码目录
+            KSRC=$(find build_dir -name "linux-6.6.110" -type d | head -n 1)
+            if [ -z "$KSRC" ]; then
+              echo "Error: Kernel source not found!"
+              exit 1
+            fi
+            echo "Kernel source found at: $KSRC"
+            
+            # 下载主线最全 ID 表并覆盖
             curl -sSL "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/usb/serial/option.c?h=v6.6.110" -o $KSRC/drivers/usb/serial/option.c
             curl -sSL "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/net/usb/qmi_wwan.c?h=v6.6.110" -o $KSRC/drivers/net/usb/qmi_wwan.c
 
@@ -36,20 +43,19 @@ jobs:
             sed -i "/#define LONGCHEER_VENDOR_ID/a #define LONGSUNG_U8300_PRODUCT_ID 0x9b05\n#define LONGSUNG_U9300_PRODUCT_ID 0x9b3c" $KSRC/drivers/usb/serial/option.c
             sed -i "/{ USB_DEVICE(LONGCHEER_VENDOR_ID, IBALL_3_5G_CONNECT) },/a \	{ USB_DEVICE(LONGCHEER_VENDOR_ID, LONGSUNG_U8300_PRODUCT_ID), .driver_info = RSVD(4) | RSVD(5) },\n\	{ USB_DEVICE(LONGCHEER_VENDOR_ID, LONGSUNG_U9300_PRODUCT_ID), .driver_info = RSVD(0) | RSVD(4) }," $KSRC/drivers/usb/serial/option.c
             
-            # 编译
+            # 编译内核模块
             make package/kernel/linux/compile V=s
           '
           
-          # 3. 将编译好的结果拷贝出来到宿主机
-          # 同样不猜路径，直接 find 找生成的 ipk
+          # 3. 收集产物
           mkdir -p ./output
           docker exec $CONTAINER_ID bash -c 'find bin/ -name "kmod-usb-serial-option*.ipk" -o -name "kmod-usb-net-qmi-wwan*.ipk"' | xargs -I {} docker cp $CONTAINER_ID:{} ./output/
           
-          # 4. 停止容器
+          # 4. 清理
           docker rm -f $CONTAINER_ID
 
       - name: Upload Result
         uses: actions/upload-artifact@v4
         with:
-          name: GL-MT6000-USB-Drivers
+          name: MT6000-Full-USB-Drivers
           path: ./output/*.ipk
