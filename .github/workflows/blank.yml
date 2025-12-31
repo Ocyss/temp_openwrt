@@ -1,50 +1,60 @@
-name: Build Full USB Modules Final
+name: Build Full USB Modules Verified
 on: [workflow_dispatch]
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: 
+    container:
       image: ghcr.io/openwrt/sdk:mediatek-filogic-24.10.4
-      options: --user root  # 显式指定 root 运行
+      options: --user root # 必须以 root 运行
     
-    env:
-      HOME: /home/build     # 强制修改 HOME 指向
-      FORCE_UNSAFE_CONFIGURE: 1 # 允许 root 编译
-
     steps:
-      - name: Environment Fix
+      - name: Initialize SDK and Fix Git
         run: |
-          # 暴力解决所有可能的目录权限锁定
-          chmod -R 777 . /home/build
-          # 绕过 git 安全检查，直接修改环境变量而非 config 文件
-          export GIT_CONFIG_PARAMETERS="'safe.directory=*'"
+          # 1. 彻底解决 Git 权限报警
+          git config --global --add safe.directory '*'
           
-          # 初始化并更新，直接指向 SDK 根目录
+          # 2. 关键：将镜像内置的 SDK 拷贝到当前 GitHub 工作目录
+          # 官方镜像 SDK 在 /home/build 下，我们需要同步过来
+          cp -af /home/build/. .
+          
+          # 3. 环境变量
+          export FORCE_UNSAFE_CONFIGURE=1
+          
+          # 4. 初始化
           ./scripts/feeds update base
           ./scripts/feeds install kmod-usb-serial-option kmod-usb-net-qmi-wwan
           make defconfig
 
-      - name: Prepare Kernel and Replace ID Table
+      - name: Patch Kernel Source (Full ID Table)
         run: |
-          # 1. 解压内核源码
+          export FORCE_UNSAFE_CONFIGURE=1
+          # 解压内核源码
           make target/linux/prepare V=s
 
-          # 2. 定位内核目录
+          # 定位源码路径
           KSRC=$(find build_dir -name "linux-6.6.110" -type d | head -n 1)
-          echo "Found Kernel Source: $KSRC"
+          echo "Kernel source is at: $KSRC"
 
-          # 3. 下载全量主线代码覆盖
+          # 1. 下载主线最全的 ID 表覆盖
           curl -sSL "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/usb/serial/option.c?h=v6.6.110" -o $KSRC/drivers/usb/serial/option.c
           curl -sSL "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/net/usb/qmi_wwan.c?h=v6.6.110" -o $KSRC/drivers/net/usb/qmi_wwan.c
 
-      - name: Final Build
+          # 2. 强制写入龙尚 ID（防止主线 6.6.110 还没合入这些具体 PID）
+          # 在 LONGCHEER_VENDOR_ID 定义后插入产品 ID
+          sed -i '/#define LONGCHEER_VENDOR_ID/a #define LONGSUNG_U8300_PRODUCT_ID 0x9b05\n#define LONGSUNG_U9300_PRODUCT_ID 0x9b3c' $KSRC/drivers/usb/serial/option.c
+          
+          # 在设备 ID 列表数组中插入绑定关系
+          sed -i '/{ USB_DEVICE(LONGCHEER_VENDOR_ID, IBALL_3_5G_CONNECT) },/a \	{ USB_DEVICE(LONGCHEER_VENDOR_ID, LONGSUNG_U8300_PRODUCT_ID), .driver_info = RSVD(4) | RSVD(5) },\n\	{ USB_DEVICE(LONGCHEER_VENDOR_ID, LONGSUNG_U9300_PRODUCT_ID), .driver_info = RSVD(0) | RSVD(4) },' $KSRC/drivers/usb/serial/option.c
+
+      - name: Final Compilation
         run: |
-          # 执行最终编译
+          export FORCE_UNSAFE_CONFIGURE=1
+          # 仅编译内核驱动包
           make package/kernel/linux/compile V=s
 
-      - name: Upload
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: MT6000-Full-USB-Drivers
+          name: GL-MT6000-USB-Drivers
           path: bin/targets/mediatek/filogic/packages/kmod-*.ipk
