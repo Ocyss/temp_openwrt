@@ -1,60 +1,55 @@
-name: Build Full USB Modules Verified
+name: Build Full USB Modules Final
 on: [workflow_dispatch]
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/openwrt/sdk:mediatek-filogic-24.10.4
-      options: --user root # 必须以 root 运行
-    
     steps:
-      - name: Initialize SDK and Fix Git
+      - name: Build in Clean Docker
         run: |
-          # 1. 彻底解决 Git 权限报警
-          git config --global --add safe.directory '*'
+          # 1. 启动容器并获取容器 ID
+          CONTAINER_ID=$(docker run -d -u root ghcr.io/openwrt/sdk:mediatek-filogic-24.10.4 tail -f /dev/null)
           
-          # 2. 关键：将镜像内置的 SDK 拷贝到当前 GitHub 工作目录
-          # 官方镜像 SDK 在 /home/build 下，我们需要同步过来
-          cp -af /home/build/. .
+          # 2. 在容器内执行环境初始化
+          # 我们不猜路径，直接通过 find 找到脚本位置并进入
+          docker exec -u root $CONTAINER_ID bash -c '
+            set -e
+            # 自动定位 SDK 根目录
+            SDK_PATH=$(find / -name "scripts" -type d -exec test -f {}/feeds \; -print -quit | sed "s/\/scripts//")
+            cd $SDK_PATH
+            
+            # 环境准备
+            export FORCE_UNSAFE_CONFIGURE=1
+            ./scripts/feeds update base
+            ./scripts/feeds install kmod-usb-serial-option kmod-usb-net-qmi-wwan
+            make defconfig
+            
+            # 准备内核源码
+            make target/linux/prepare V=s
+            KSRC=$(find build_dir -name "linux-6.6.110" -type d | head -n 1)
+            
+            # 下载主线最全 ID 表并覆盖 (确保 ID 最全)
+            curl -sSL "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/usb/serial/option.c?h=v6.6.110" -o $KSRC/drivers/usb/serial/option.c
+            curl -sSL "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/net/usb/qmi_wwan.c?h=v6.6.110" -o $KSRC/drivers/net/usb/qmi_wwan.c
+
+            # 强制插入 Longsung 补丁 (双重保险)
+            sed -i "/#define LONGCHEER_VENDOR_ID/a #define LONGSUNG_U8300_PRODUCT_ID 0x9b05\n#define LONGSUNG_U9300_PRODUCT_ID 0x9b3c" $KSRC/drivers/usb/serial/option.c
+            sed -i "/{ USB_DEVICE(LONGCHEER_VENDOR_ID, IBALL_3_5G_CONNECT) },/a \	{ USB_DEVICE(LONGCHEER_VENDOR_ID, LONGSUNG_U8300_PRODUCT_ID), .driver_info = RSVD(4) | RSVD(5) },\n\	{ USB_DEVICE(LONGCHEER_VENDOR_ID, LONGSUNG_U9300_PRODUCT_ID), .driver_info = RSVD(0) | RSVD(4) }," $KSRC/drivers/usb/serial/option.c
+            
+            # 编译
+            make package/kernel/linux/compile V=s
+          '
           
-          # 3. 环境变量
-          export FORCE_UNSAFE_CONFIGURE=1
+          # 3. 将编译好的结果拷贝出来到宿主机
+          # 同样不猜路径，直接 find 找生成的 ipk
+          mkdir -p ./output
+          docker exec $CONTAINER_ID bash -c 'find bin/ -name "kmod-usb-serial-option*.ipk" -o -name "kmod-usb-net-qmi-wwan*.ipk"' | xargs -I {} docker cp $CONTAINER_ID:{} ./output/
           
-          # 4. 初始化
-          ./scripts/feeds update base
-          ./scripts/feeds install kmod-usb-serial-option kmod-usb-net-qmi-wwan
-          make defconfig
+          # 4. 停止容器
+          docker rm -f $CONTAINER_ID
 
-      - name: Patch Kernel Source (Full ID Table)
-        run: |
-          export FORCE_UNSAFE_CONFIGURE=1
-          # 解压内核源码
-          make target/linux/prepare V=s
-
-          # 定位源码路径
-          KSRC=$(find build_dir -name "linux-6.6.110" -type d | head -n 1)
-          echo "Kernel source is at: $KSRC"
-
-          # 1. 下载主线最全的 ID 表覆盖
-          curl -sSL "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/usb/serial/option.c?h=v6.6.110" -o $KSRC/drivers/usb/serial/option.c
-          curl -sSL "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/net/usb/qmi_wwan.c?h=v6.6.110" -o $KSRC/drivers/net/usb/qmi_wwan.c
-
-          # 2. 强制写入龙尚 ID（防止主线 6.6.110 还没合入这些具体 PID）
-          # 在 LONGCHEER_VENDOR_ID 定义后插入产品 ID
-          sed -i '/#define LONGCHEER_VENDOR_ID/a #define LONGSUNG_U8300_PRODUCT_ID 0x9b05\n#define LONGSUNG_U9300_PRODUCT_ID 0x9b3c' $KSRC/drivers/usb/serial/option.c
-          
-          # 在设备 ID 列表数组中插入绑定关系
-          sed -i '/{ USB_DEVICE(LONGCHEER_VENDOR_ID, IBALL_3_5G_CONNECT) },/a \	{ USB_DEVICE(LONGCHEER_VENDOR_ID, LONGSUNG_U8300_PRODUCT_ID), .driver_info = RSVD(4) | RSVD(5) },\n\	{ USB_DEVICE(LONGCHEER_VENDOR_ID, LONGSUNG_U9300_PRODUCT_ID), .driver_info = RSVD(0) | RSVD(4) },' $KSRC/drivers/usb/serial/option.c
-
-      - name: Final Compilation
-        run: |
-          export FORCE_UNSAFE_CONFIGURE=1
-          # 仅编译内核驱动包
-          make package/kernel/linux/compile V=s
-
-      - name: Upload Artifacts
+      - name: Upload Result
         uses: actions/upload-artifact@v4
         with:
           name: GL-MT6000-USB-Drivers
-          path: bin/targets/mediatek/filogic/packages/kmod-*.ipk
+          path: ./output/*.ipk
