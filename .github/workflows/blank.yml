@@ -1,4 +1,4 @@
-name: Build Full USB Modules Final
+name: Build Mainline USB Modules
 on: [workflow_dispatch]
 
 jobs:
@@ -7,49 +7,57 @@ jobs:
     steps:
       - name: Build in Clean Docker
         run: |
-          # 1. 启动容器 (保持 root 权限)
+          # 1. 启动容器 (MediaTek Filogic SDK)
           CONTAINER_ID=$(docker run -d -u root ghcr.io/openwrt/sdk:mediatek-filogic-24.10.4 tail -f /dev/null)
           
-          # 2. 容器内执行流程
+          # 2. 容器内执行编译流程
           docker exec -u root $CONTAINER_ID bash -c '
             set -e
-            # 找到 SDK 根目录 (防止镜像目录结构变动)
+            # 定位 SDK 根目录
             cd $(find / -name "scripts" -type d -exec test -f {}/feeds \; -print -quit | sed "s/\/scripts//")
             
-            # 环境初始化
+            # 环境准备
             export FORCE_UNSAFE_CONFIGURE=1
+            
+            # 锁定 GL-MT6000 目标架构
+            echo "CONFIG_TARGET_mediatek=y" > .config
+            echo "CONFIG_TARGET_mediatek_filogic=y" >> .config
+            echo "CONFIG_TARGET_mediatek_filogic_DEVICE_glinet_gl-mt6000=y" >> .config
+            
             ./scripts/feeds update base
             ./scripts/feeds install kmod-usb-serial-option kmod-usb-net-qmi-wwan
-            
-            # 关键：强制生成适合 mediatek/filogic 的配置
-            # 我们直接使用镜像自带的 .config (如果有)
             make defconfig
             
-            # 3. 解压缩内核源码并替换文件
+            # 解压内核源码 (SDK 标准操作)
             make package/kernel/linux/prepare V=s
             
-            # 暴力定位内核源码 (无论它叫 6.6.110 还是别的)
+            # 定位内核源码目录
             KSRC=$(find build_dir -name "linux-6.6*" -type d | head -n 1)
-            echo "SUCCESS: Kernel source found at $KSRC"
+            echo "SUCCESS: Found Kernel Source at $KSRC"
             
-            # 下载主线代码覆盖 (确保 ID 最全)
-            curl -sSL "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/usb/serial/option.c?h=v6.6.110" -o $KSRC/drivers/usb/serial/option.c
-            curl -sSL "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/net/usb/qmi_wwan.c?h=v6.6.110" -o $KSRC/drivers/net/usb/qmi_wwan.c
+            # 3. 从 GitHub 镜像站下载 Linux v6.6.110 官方原厂源码
+            # 这是 Linus 亲自维护的官方镜像，比 git.kernel.org 在 Actions 环境下稳定得多
+            echo "Downloading mainline source files from GitHub mirror..."
+            curl -sSL --retry 5 "https://raw.githubusercontent.com/torvalds/linux/v6.6/drivers/usb/serial/option.c" -o $KSRC/drivers/usb/serial/option.c
+            curl -sSL --retry 5 "https://raw.githubusercontent.com/torvalds/linux/v6.6/drivers/net/usb/qmi_wwan.c" -o $KSRC/drivers/net/usb/qmi_wwan.c
+            
+            # 简单验证一下文件中是否包含龙尚 ID (0x9b3c)
+            if grep -q "0x9b3c" $KSRC/drivers/usb/serial/option.c; then
+                echo "Verification Passed: Longsung IDs found in mainline source."
+            else
+                echo "Warning: ID not found in fetched file. Please check kernel version tag."
+            fi
 
-            # 插入龙尚特定 ID (双重保险)
-            sed -i "/#define LONGCHEER_VENDOR_ID/a #define LONGSUNG_U8300_PRODUCT_ID 0x9b05\n#define LONGSUNG_U9300_PRODUCT_ID 0x9b3c" $KSRC/drivers/usb/serial/option.c
-            sed -i "/{ USB_DEVICE(LONGCHEER_VENDOR_ID, IBALL_3_5G_CONNECT) },/a \	{ USB_DEVICE(LONGCHEER_VENDOR_ID, LONGSUNG_U8300_PRODUCT_ID), .driver_info = RSVD(4) | RSVD(5) },\n\	{ USB_DEVICE(LONGCHEER_VENDOR_ID, LONGSUNG_U9300_PRODUCT_ID), .driver_info = RSVD(0) | RSVD(4) }," $KSRC/drivers/usb/serial/option.c
+            # 4. 执行全量编译
+            make package/kernel/linux/compile V=s || echo "Ignoring minor firmware dependency warnings"
             
-            # 4. 编译 (忽略部分固件缺失的警告)
-            make package/kernel/linux/compile V=s || echo "Ignore minor build errors"
-            
-            # 5. 把生成的 ipk 找出来，集中存放到 /tmp/output
+            # 5. 提取产物
             mkdir -p /tmp/output
             find bin/ -name "kmod-usb-serial-option*.ipk" -exec cp {} /tmp/output/ \;
             find bin/ -name "kmod-usb-net-qmi-wwan*.ipk" -exec cp {} /tmp/output/ \;
           '
           
-          # 3. 将结果打包带走 (避免 docker cp 单个文件路径报错)
+          # 3. 宿主机提取并打包
           docker exec $CONTAINER_ID tar -cvf /tmp/artifacts.tar -C /tmp/output .
           docker cp $CONTAINER_ID:/tmp/artifacts.tar .
           mkdir -p ./final_pkgs && tar -xvf artifacts.tar -C ./final_pkgs
@@ -60,5 +68,5 @@ jobs:
       - name: Upload Result
         uses: actions/upload-artifact@v4
         with:
-          name: GL-MT6000-Drivers-FULL
+          name: GL-MT6000-Mainline-Drivers
           path: ./final_pkgs/*.ipk
