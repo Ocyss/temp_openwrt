@@ -1,49 +1,50 @@
-name: Build Full USB Modules
+name: Build Full USB Modules Final
 on: [workflow_dispatch]
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: ghcr.io/openwrt/sdk:mediatek-filogic-24.10.4
+    container: 
+      image: ghcr.io/openwrt/sdk:mediatek-filogic-24.10.4
+      options: --user root  # 显式指定 root 运行
+    
+    env:
+      HOME: /home/build     # 强制修改 HOME 指向
+      FORCE_UNSAFE_CONFIGURE: 1 # 允许 root 编译
+
     steps:
-      - name: Fix Permissions and Setup
+      - name: Environment Fix
         run: |
-          # 给予当前目录所有权限，避免 SDK 报错
-          git config --global --add safe.directory /home/build
-          # 初始化 feeds
+          # 暴力解决所有可能的目录权限锁定
+          chmod -R 777 . /home/build
+          # 绕过 git 安全检查，直接修改环境变量而非 config 文件
+          export GIT_CONFIG_PARAMETERS="'safe.directory=*'"
+          
+          # 初始化并更新，直接指向 SDK 根目录
           ./scripts/feeds update base
           ./scripts/feeds install kmod-usb-serial-option kmod-usb-net-qmi-wwan
-          # 生成基础配置
           make defconfig
 
-      - name: Extract Kernel Source and Replace Files
+      - name: Prepare Kernel and Replace ID Table
         run: |
-          # 1. 强制解压内核源码 (不进入交互界面)
+          # 1. 解压内核源码
           make target/linux/prepare V=s
 
-          # 2. 找到解压后的内核目录
+          # 2. 定位内核目录
           KSRC=$(find build_dir -name "linux-6.6.110" -type d | head -n 1)
-          echo "Kernel Source found at: $KSRC"
+          echo "Found Kernel Source: $KSRC"
 
-          # 3. 从官方主线下载最新的、带完整 ID 表的源码文件覆盖进去
+          # 3. 下载全量主线代码覆盖
           curl -sSL "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/usb/serial/option.c?h=v6.6.110" -o $KSRC/drivers/usb/serial/option.c
           curl -sSL "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/net/usb/qmi_wwan.c?h=v6.6.110" -o $KSRC/drivers/net/usb/qmi_wwan.c
 
-          # 4. 验证文件是否包含你的 Longsung ID (防止官方主线还没同步)
-          if ! grep -q "0x9b3c" $KSRC/drivers/usb/serial/option.c; then
-            echo "Mainline file missing ID, patching manually..."
-            sed -i '/LONGCHEER_VENDOR_ID/a #define LONGSUNG_U9300_PRODUCT_ID 0x9b3c' $KSRC/drivers/usb/serial/option.c
-            # 在合适的位置插入 ID 绑定 (简易处理)
-            sed -i '/{ USB_DEVICE(LONGCHEER_VENDOR_ID, IBALL_3_5G_CONNECT) },/a \	{ USB_DEVICE(LONGCHEER_VENDOR_ID, LONGSUNG_U9300_PRODUCT_ID), .driver_info = RSVD(0) | RSVD(4) },' $KSRC/drivers/usb/serial/option.c
-          fi
-
-      - name: Build Modules
+      - name: Final Build
         run: |
-          # 仅编译内核模块相关包
+          # 执行最终编译
           make package/kernel/linux/compile V=s
 
-      - name: Upload Artifacts
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: full-usb-id-modules
+          name: MT6000-Full-USB-Drivers
           path: bin/targets/mediatek/filogic/packages/kmod-*.ipk
