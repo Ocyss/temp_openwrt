@@ -1,0 +1,33 @@
+name: Build Kernel Modules
+on: [workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup SDK
+        run: |
+          docker run --name sdk -d -v ${{ github.workspace }}:/home/sdk/data ghcr.io/openwrt/sdk:mediatek-filogic-24.10.4 tail -f /dev/null
+          
+      - name: Patch and Build
+        run: |
+          # 在容器内操作
+          docker exec -u root sdk bash -c "
+            cd /home/sdk
+            ./scripts/feeds update base && ./scripts/feeds install kmod-usb-serial-option kmod-usb-net-qmi-wwan
+            
+            sed -i '/LONGCHEER_VENDOR_ID/a #define LONGSUNG_U8300_PRODUCT_ID 0x9b05\n#define LONGSUNG_U9300_PRODUCT_ID 0x9b3c' build_dir/target-aarch64_cortex-a53_musl/linux-mediatek_filogic/linux-6.6.110/drivers/usb/serial/option.c
+            
+            # 执行编译
+            make defconfig
+            make package/kernel/linux/compile V=s
+          "
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-modules
+          path: ${{ github.workspace }}/bin/targets/mediatek/filogic/packages/kmod-*.ipk
