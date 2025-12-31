@@ -4,30 +4,38 @@ on: [workflow_dispatch]
 jobs:
   build:
     runs-on: ubuntu-latest
+    container: ghcr.io/openwrt/sdk:mediatek-filogic-24.10.4 # 直接在容器里跑，路径才对
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup SDK
+      - name: Initialize SDK
         run: |
-          docker run --name sdk -d -v ${{ github.workspace }}:/home/sdk/data ghcr.io/openwrt/sdk:mediatek-filogic-24.10.4 tail -f /dev/null
+          # 修正权限问题并初始化
+          chown -R build:build /home/build
+          sudo -u build ./scripts/feeds update base
           
-      - name: Patch and Build
+      - name: Force Full USB ID Table
         run: |
-          # 在容器内操作
-          docker exec -u root sdk bash -c "
-            cd /home/sdk
-            ./scripts/feeds update base && ./scripts/feeds install kmod-usb-serial-option kmod-usb-net-qmi-wwan
-            
-            sed -i '/LONGCHEER_VENDOR_ID/a #define LONGSUNG_U8300_PRODUCT_ID 0x9b05\n#define LONGSUNG_U9300_PRODUCT_ID 0x9b3c' build_dir/target-aarch64_cortex-a53_musl/linux-mediatek_filogic/linux-6.6.110/drivers/usb/serial/option.c
-            
-            # 执行编译
-            make defconfig
-            make package/kernel/linux/compile V=s
-          "
+          # 1. 下载 Linux 6.6 主线最全的 option.c 和 qmi_wwan.c
+          curl -sSL "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/usb/serial/option.c?h=v6.6.110" -o /tmp/option.c
+          curl -sSL "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/net/usb/qmi_wwan.c?h=v6.6.110" -o /tmp/qmi_wwan.c
 
-      - name: Upload Artifacts
+          # 2. 准备内核源码目录 (SDK 需要先 prepare 才能看到源码)
+          sudo -u build make kernel_menuconfig # 这步会自动解压内核源码，然后直接关掉即可
+          
+          # 3. 找到源码路径 (SDK 的路径带哈希，用 find 找)
+          KSRC=$(find build_dir -name "linux-6.6.110" -type d | head -n 1)
+          
+          # 4. 覆盖为全量代码
+          cp /tmp/option.c $KSRC/drivers/usb/serial/option.c
+          cp /tmp/qmi_wwan.c $KSRC/drivers/net/usb/qmi_wwan.c
+          
+      - name: Build Modules
+        run: |
+          # 只编译内核包
+          sudo -u build make defconfig
+          sudo -u build make package/kernel/linux/compile V=s
+
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-modules
-          path: ${{ github.workspace }}/bin/targets/mediatek/filogic/packages/kmod-*.ipk
+          name: full-usb-modules
+          path: bin/targets/mediatek/filogic/packages/kmod-*.ipk
